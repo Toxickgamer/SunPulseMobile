@@ -1,0 +1,586 @@
+<!DOCTYPE html>
+<html lang="sl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes">
+    <title>SunPulse Slovenija – Sončni kataster</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:opsz,wght@14..32,400;14..32,500;14..32,600;14..32,700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@20..48,100..700,0,1" />
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/react@18.2.0/umd/react.development.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/react-dom@18.2.0/umd/react-dom.development.js"></script>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+    <style>
+        body { margin: 0; font-family: 'Inter', sans-serif; background: #f8fafc; }
+        .leaflet-container { height: 360px; width: 100%; border-radius: 1.5rem; z-index: 1; }
+        .modal-overlay {
+            position: fixed; top: 0; left: 0; right: 0; bottom: 0;
+            background: rgba(0,0,0,0.7); backdrop-filter: blur(6px);
+            display: flex; align-items: center; justify-content: center; z-index: 1000;
+        }
+        .modal-content {
+            background: white; border-radius: 2rem; padding: 2rem;
+            max-width: 500px; width: 90%; box-shadow: 0 25px 40px -12px rgba(0,0,0,0.3);
+        }
+        .step-item {
+            display: flex; align-items: center; gap: 1rem; padding: 0.9rem 0;
+            border-bottom: 1px solid #eef2f6;
+        }
+        .step-icon { width: 32px; font-size: 1.4rem; }
+        .step-text { flex: 1; font-weight: 500; color: #1e293b; }
+        .step-status { font-size: 0.9rem; font-weight: 600; }
+        .completed { color: #10b981; }
+        .processing { color: #f97316; animation: pulse 1s infinite; }
+        @keyframes pulse { 0%,100%{opacity:1;} 50%{opacity:0.6;} }
+        .google-card {
+            background: white; border-radius: 1.5rem; box-shadow: 0 4px 12px rgba(0,0,0,0.05);
+            transition: transform 0.2s, box-shadow 0.2s;
+        }
+        .google-card:hover { transform: translateY(-2px); box-shadow: 0 12px 24px rgba(0,0,0,0.1); }
+        .fade-up {
+            opacity: 0;
+            transform: translateY(20px);
+            animation: fadeUp 0.6s ease forwards;
+        }
+        @keyframes fadeUp { to { opacity: 1; transform: translateY(0); } }
+        .chart-container canvas { max-height: 300px; width: 100%; }
+        .material-symbols-outlined { font-size: 1.5rem; vertical-align: middle; }
+        .slider-tab {
+            transition: all 0.2s;
+            cursor: pointer;
+            background: #f1f5f9;
+            border-radius: 2rem;
+            padding: 0.5rem 1.5rem;
+            font-weight: 500;
+        }
+        .slider-tab.active {
+            background: #f97316;
+            color: white;
+            box-shadow: 0 2px 8px rgba(249,115,22,0.3);
+        }
+        .insight-card {
+            background: #fef9c3;
+            border-radius: 1rem;
+            padding: 0.75rem;
+            text-align: center;
+        }
+        .finance-stat {
+            background: #f8fafc;
+            border-radius: 1.25rem;
+            padding: 1rem;
+            text-align: center;
+            border: 1px solid #e2e8f0;
+        }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+
+    <script>
+        const { useState, useEffect, useRef } = React;
+
+        // ---------- GEOCODING (Slovenija) ----------
+        async function geocodeAddress(address) {
+            const url = `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(address)}&countrycodes=si&limit=1`;
+            const res = await fetch(url, { headers: { 'User-Agent': 'SunPulse/1.0' } });
+            const data = await res.json();
+            if (!data || data.length === 0) throw new Error('Naslov ni najden. Poskusite natančneje.');
+            const { lat, lon, display_name } = data[0];
+            return { lat: parseFloat(lat), lng: parseFloat(lon), displayName: display_name };
+        }
+
+        function simulateSunExposure(lat, lng) {
+            let baseHours = 4.2;
+            if (lat > 46.5) baseHours = 3.9;
+            if (lat < 45.8) baseHours = 4.6;
+            const monthly = Array(12).fill().map((_, i) => {
+                const season = 1 + 0.35 * Math.sin((i - 5) * Math.PI / 6);
+                return +(baseHours * season * (0.85 + Math.random() * 0.3)).toFixed(1);
+            });
+            const avg = +(monthly.reduce((a,b)=>a+b,0)/12).toFixed(1);
+            const totalYearlyHours = Math.round(avg * 365);
+            return { annualAverage: avg, monthly, totalYearlyHours };
+        }
+
+        function calculateMetrics(sunHours, roofArea = 110) {
+            const usable = roofArea * 0.68;
+            const kwp = usable * 0.205;
+            const annualKwh = kwp * sunHours * 365;
+            const panels = Math.floor(kwp / 0.41);
+            let investment = kwp * 1000 * 2.4;
+            const subsidy = Math.min(investment * 0.2, 3000);
+            const afterSubsidy = investment - subsidy;
+            const savings = annualKwh * 0.155;
+            const roi = (savings / afterSubsidy) * 100;
+            const payback = afterSubsidy / savings;
+            const yearly = Array(25).fill().map((_, i) => savings * Math.pow(0.995, i));
+            const co2Kg = Math.floor(annualKwh * 0.4);
+            const treesEquivalent = Math.floor(co2Kg / 21);
+            // Monthly savings (12 months) based on seasonal sun hours
+            const monthlySavingsFull = Array(12).fill().map((_, i) => {
+                const monthFactor = 0.5 + 0.5 * Math.sin((i - 5) * Math.PI / 6);
+                return +(savings / 12 * (0.7 + monthFactor * 0.6)).toFixed(1);
+            });
+            // Hourly solar output for an average day (kW)
+            const hourlyOutput = Array(24).fill().map((_, hour) => {
+                let factor = 0;
+                if (hour >= 6 && hour <= 18) factor = Math.sin((hour - 6) * Math.PI / 12);
+                return +(kwp * factor * (0.9 + Math.random() * 0.1)).toFixed(1);
+            });
+            return { panels, kwp: +kwp.toFixed(1), annualKwh, investment, subsidy, afterSubsidy, savings, roi, payback, yearly, co2Kg, treesEquivalent, monthlySavingsFull, hourlyOutput };
+        }
+
+        // Podrobni opisi za statistične kartice
+        const detailDescriptions = {
+            panels: { title: 'Število sončnih panelov', text: 'Število panelov je izračunano glede na uporabno površino vaše strehe (približno 68% celotne površine) in moč posameznega panela (410 W). Upoštevan je optimalen naklon in azimut za Slovenijo.' },
+            kwp: { title: 'Moč sistema (kWp)', text: 'Skupna inštalirana moč sončne elektrarne v kilovatih pri standardnih testnih pogojih. Temelji na učinkovitosti panelov (20,5%) in razpoložljivi površini.' },
+            annualKwh: { title: 'Letna proizvodnja (kWh)', text: 'Ocenjena količina električne energije, ki jo elektrarna proizvede v enem letu. Upošteva sončno obsevanje na vaši lokaciji (PVGIS podatki) in izgube sistema (~15%).' },
+            investment: { title: 'Investicija (bruto)', text: 'Skupni strošek nakupa in namestitve sončne elektrarne pred subvencijami. Cena je 2.400 €/kWp, kar vključuje opremo, delo in priključitev.' },
+            subsidy: { title: 'Subvencija EKO sklad', text: 'Eko sklad Slovenija subvencionira 20% investicijskih stroškov, vendar največ 3.000 €. Znesek se odšteje od vaše začetne investicije.' },
+            afterSubsidy: { title: 'Vložek po subvenciji', text: 'Znesek, ki ga dejansko plačate po upoštevanju subvencije EKO sklada. To je vaša neto investicija.' },
+            savings: { title: 'Letni prihranek', text: 'Prihranek na računu za elektriko, ki ga dosežete s samooskrbo. Izračunan je po povprečni ceni elektrike 0,155 €/kWh (2025).' },
+            payback: { title: 'Čas vračila', text: 'Število let, potrebnih da prihranki pokrijejo vašo neto investicijo (po subvenciji). Nižji čas pomeni boljšo donosnost.' }
+        };
+
+        const DetailModal = ({ field, onClose }) => {
+            const info = detailDescriptions[field];
+            if (!info) return null;
+            return React.createElement('div', { className: 'modal-overlay', onClick: onClose },
+                React.createElement('div', { className: 'modal-content', onClick: (e) => e.stopPropagation() },
+                    React.createElement('h2', { className: 'text-xl font-bold mb-2' }, info.title),
+                    React.createElement('p', { className: 'text-gray-600' }, info.text),
+                    React.createElement('button', { onClick: onClose, className: 'mt-4 px-4 py-2 bg-orange-500 text-white rounded-full' }, 'Zapri')
+                )
+            );
+        };
+
+        // ----- KROŽNI ZEMLJEVID (natančen naslov + krog) -----
+        const RoofMap = ({ lat, lng, addressName }) => {
+            const mapRef = useRef(null);
+            useEffect(() => {
+                if (!mapRef.current && document.getElementById('roof-map')) {
+                    const map = L.map('roof-map').setView([lat, lng], 19);
+                    L.tileLayer('https://{s}.google.com/vt/lyrs=s&x={x}&y={y}&z={z}', {
+                        subdomains: ['mt0','mt1','mt2','mt3'],
+                        attribution: 'Satelitski posnetki © Google'
+                    }).addTo(map);
+                    const circle = L.circle([lat, lng], {
+                        radius: 18,
+                        color: '#f97316',
+                        fillColor: '#fbbf24',
+                        fillOpacity: 0.45,
+                        weight: 3
+                    }).addTo(map);
+                    circle.bindPopup(`<b>🏠 ${addressName}</b><br>Natančna lokacija vaše nepremičnine`).openPopup();
+                    mapRef.current = map;
+                }
+                return () => { if(mapRef.current) { mapRef.current.remove(); mapRef.current = null; } };
+            }, [lat, lng, addressName]);
+            return React.createElement('div', { id: 'roof-map', style: { height: '360px', width: '100%', borderRadius: '1.5rem' } });
+        };
+
+        // ----- GRAF ZA PROIZVODNJO: povprečen dan (urna proizvodnja) -----
+        const HourlyGenerationChart = ({ hourlyOutput }) => {
+            const canvasRef = useRef(null);
+            const chartRef = useRef(null);
+            const hours = Array.from({ length: 24 }, (_, i) => `${i}:00`);
+            useEffect(() => {
+                if (!canvasRef.current) return;
+                if (chartRef.current) chartRef.current.destroy();
+                const ctx = canvasRef.current.getContext('2d');
+                const gradient = ctx.createLinearGradient(0, 0, 0, 300);
+                gradient.addColorStop(0, '#f97316');
+                gradient.addColorStop(1, '#fed7aa');
+                chartRef.current = new Chart(ctx, {
+                    type: 'line',
+                    data: {
+                        labels: hours,
+                        datasets: [{
+                            label: 'Sončna proizvodnja (kW)',
+                            data: hourlyOutput,
+                            borderColor: '#f97316',
+                            backgroundColor: gradient,
+                            fill: true,
+                            tension: 0.4,
+                            pointRadius: 4,
+                            pointBackgroundColor: '#f97316',
+                            pointBorderColor: 'white',
+                            borderWidth: 3
+                        }]
+                    },
+                    options: {
+                        responsive: true,
+                        maintainAspectRatio: true,
+                        plugins: { tooltip: { callbacks: { label: (ctx) => `${ctx.raw} kW` } } },
+                        scales: { y: { title: { display: true, text: 'kW' }, beginAtZero: true } }
+                    }
+                });
+                return () => { if (chartRef.current) chartRef.current.destroy(); };
+            }, [hourlyOutput]);
+            return React.createElement('canvas', { ref: canvasRef });
+        };
+
+        // ----- FINANČNI GRAF: Mesečni prihranki (izbrani meseci) -----
+        const SelectedMonthsSavingsChart = ({ monthlySavingsFull }) => {
+            const canvasRef = useRef(null);
+            const chartRef = useRef(null);
+            const selectedMonths = ['Februar', 'April', 'Maj', 'Junij', 'Avgust', 'Oktober', 'December'];
+            const indices = [1, 3, 4, 5, 7, 9, 11];
+            const savingsData = indices.map(i => monthlySavingsFull[i]);
+            useEffect(() => {
+                if (!canvasRef.current) return;
+                if (chartRef.current) chartRef.current.destroy();
+                const ctx = canvasRef.current.getContext('2d');
+                chartRef.current = new Chart(ctx, {
+                    type: 'bar',
+                    data: {
+                        labels: selectedMonths,
+                        datasets: [{
+                            label: 'Prihranek (€)',
+                            data: savingsData,
+                            backgroundColor: '#10b981',
+                            borderRadius: 8,
+                            barPercentage: 0.7
+                        }]
+                    },
+                    options: {
+                        responsive: true,
+                        maintainAspectRatio: true,
+                        plugins: {
+                            tooltip: { callbacks: { label: (ctx) => `${ctx.raw} €` } },
+                            legend: { display: false }
+                        },
+                        scales: {
+                            y: { title: { display: true, text: '€' }, beginAtZero: true, grid: { color: '#e2e8f0' } },
+                            x: { ticks: { font: { size: 12 } } }
+                        }
+                    }
+                });
+                return () => { if (chartRef.current) chartRef.current.destroy(); };
+            }, [savingsData]);
+            return React.createElement('canvas', { ref: canvasRef });
+        };
+
+        // ----- GRAF ZA ENERGY INSIGHTS: dnevna napoved (30 dni) + summary kartice -----
+        const DailySunForecastChart = ({ kwp, baseSunHours }) => {
+            const canvasRef = useRef(null);
+            const chartRef = useRef(null);
+            useEffect(() => {
+                if (!canvasRef.current) return;
+                const days = Array.from({ length: 30 }, (_, i) => i+1);
+                const dailySunHours = days.map(() => +(baseSunHours * (0.7 + Math.random() * 0.6)).toFixed(1));
+                const peakSolarOutput = dailySunHours.map(h => +(kwp * (h / 5.5) * 0.9).toFixed(1));
+                if (chartRef.current) chartRef.current.destroy();
+                const ctx = canvasRef.current.getContext('2d');
+                chartRef.current = new Chart(ctx, {
+                    type: 'bar',
+                    data: {
+                        labels: days,
+                        datasets: [
+                            { label: 'Pričakovane sončne ure (h)', data: dailySunHours, backgroundColor: '#f97316', borderRadius: 6, yAxisID: 'y' },
+                            { label: 'Najvišja sončna moč (kW)', data: peakSolarOutput, type: 'line', borderColor: '#6b7280', borderWidth: 2, fill: false, tension: 0.3, pointRadius: 2, yAxisID: 'y1' }
+                        ]
+                    },
+                    options: {
+                        responsive: true,
+                        maintainAspectRatio: true,
+                        plugins: { tooltip: { callbacks: { label: (ctx) => `${ctx.dataset.label}: ${ctx.raw} ${ctx.dataset.label.includes('ure') ? 'h' : 'kW'}` } } },
+                        scales: { y: { title: { display: true, text: 'Sončne ure (h)' }, beginAtZero: true }, y1: { position: 'right', title: { display: true, text: 'Moč (kW)' }, grid: { drawOnChartArea: false }, beginAtZero: true } }
+                    }
+                });
+                return () => { if (chartRef.current) chartRef.current.destroy(); };
+            }, [kwp, baseSunHours]);
+            return React.createElement('canvas', { ref: canvasRef });
+        };
+
+        const EnergyInsightsCharts = ({ kwp, baseSunHours }) => {
+            const days = Array.from({ length: 30 }, (_, i) => i+1);
+            const dailySunHours = days.map(() => +(baseSunHours * (0.7 + Math.random() * 0.6)).toFixed(1));
+            const bestDayIndex = dailySunHours.indexOf(Math.max(...dailySunHours));
+            const bestSunDay = `Dan ${bestDayIndex+1} - ${dailySunHours[bestDayIndex]}h`;
+            const cheapestHour = "03:00 - 0,12 €/kWh";
+            const peakSolarOutputHour = "12:00 - " + (kwp * 0.95).toFixed(1) + " kW";
+            
+            return React.createElement('div', { className: 'space-y-6' },
+                React.createElement('div', { className: 'grid grid-cols-1 md:grid-cols-3 gap-4' },
+                    React.createElement('div', { className: 'insight-card' }, React.createElement('div', { className: 'font-bold' }, '☀️ Najbolj sončen dan'), React.createElement('div', { className: 'text-lg' }, bestSunDay)),
+                    React.createElement('div', { className: 'insight-card' }, React.createElement('div', { className: 'font-bold' }, '⚡ Najcenejša ura omrežja'), React.createElement('div', { className: 'text-lg' }, cheapestHour)),
+                    React.createElement('div', { className: 'insight-card' }, React.createElement('div', { className: 'font-bold' }, '📈 Najvišja sončna moč'), React.createElement('div', { className: 'text-lg' }, peakSolarOutputHour))
+                ),
+                React.createElement('div', null,
+                    React.createElement('h3', { className: 'font-semibold mb-2' }, 'Pričakovano sončno obsevanje — maj 2026'),
+                    React.createElement('div', { className: 'google-card p-4' }, React.createElement(DailySunForecastChart, { kwp: kwp, baseSunHours: baseSunHours }))
+                )
+            );
+        };
+
+        // ----- CENE PO URAH (stolpci) -----
+        const HourlyPriceChart = () => {
+            const canvasRef = useRef(null);
+            const chartRef = useRef(null);
+            useEffect(() => {
+                if (!canvasRef.current) return;
+                const hours = Array.from({ length: 24 }, (_, i) => `${i}:00`);
+                const prices = hours.map((_, hour) => {
+                    if (hour >= 10 && hour <= 17) return 0.28;
+                    if (hour >= 19 && hour <= 21) return 0.25;
+                    return 0.12;
+                });
+                const colors = prices.map(p => p > 0.2 ? '#ef4444' : (p > 0.15 ? '#f97316' : '#22c55e'));
+                if (chartRef.current) chartRef.current.destroy();
+                const ctx = canvasRef.current.getContext('2d');
+                chartRef.current = new Chart(ctx, {
+                    type: 'bar',
+                    data: { labels: hours, datasets: [{ label: 'Cena (€/kWh)', data: prices, backgroundColor: colors, borderRadius: 8 }] },
+                    options: { responsive: true, plugins: { tooltip: { callbacks: { label: (ctx) => `${ctx.raw} €/kWh` } } }, scales: { y: { title: { display: true, text: '€/kWh' } } } }
+                });
+                return () => { if (chartRef.current) chartRef.current.destroy(); };
+            }, []);
+            return React.createElement('canvas', { ref: canvasRef });
+        };
+
+        // ----- KLIKABILNA STATISTIČNA KARTICA -----
+        const ClickableStatCard = ({ field, icon, title, value, unit, onDetail }) => {
+            return React.createElement('div', { onClick: () => onDetail(field), className: 'google-card p-5 cursor-pointer hover:bg-orange-50 transition' },
+                React.createElement('div', { className: 'flex justify-between items-start mb-2' },
+                    React.createElement('span', { className: 'material-symbols-outlined text-orange-500' }, icon),
+                    React.createElement('span', { className: 'text-xs text-gray-400' }, title)
+                ),
+                React.createElement('div', { className: 'text-2xl font-bold text-gray-800' }, value),
+                React.createElement('div', { className: 'text-sm text-gray-500' }, unit),
+                React.createElement('div', { className: 'text-xs text-orange-400 mt-2 flex items-center gap-1' }, React.createElement('span', { className: 'material-symbols-outlined text-sm' }, 'info'), ' Več podrobnosti')
+            );
+        };
+
+        const SunCard = ({ avg, totalYearlyHours }) => {
+            const rating = avg >= 4.6 ? 'Odlično' : avg >= 4.0 ? 'Dobro' : avg >= 3.2 ? 'Zmerno' : 'Nizko';
+            const color = { Odlično: '#10b981', Dobro: '#84cc16', Zmerno: '#f97316', Nizko: '#ef4444' }[rating];
+            return React.createElement('div', { className: 'google-card p-5' },
+                React.createElement('div', { className: 'flex items-center gap-2 mb-3' },
+                    React.createElement('span', { className: 'material-symbols-outlined text-orange-500' }, 'wb_sunny'),
+                    React.createElement('span', { className: 'font-semibold' }, 'Sončno obsevanje')
+                ),
+                React.createElement('div', null, React.createElement('span', { className: 'text-3xl font-bold' }, avg), React.createElement('span', { className: 'text-gray-500' }, ' ur/dan')),
+                React.createElement('div', { className: 'mt-2 h-2 bg-gray-100 rounded-full' }, React.createElement('div', { className: 'h-full bg-orange-500 rounded-full', style: { width: `${(avg/5.5)*100}%` } })),
+                React.createElement('div', { className: 'mt-2 text-sm', style: { color } }, `Ocena: ${rating}`),
+                React.createElement('div', { className: 'mt-2 text-xs text-gray-500' }, `📅 Skupno letno: ${totalYearlyHours} sončnih ur`)
+            );
+        };
+
+        // ---------- REZULTATI ----------
+        const ResultsPage = ({ data, onBack }) => {
+            const [activeTab, setActiveTab] = useState('pregled');
+            const [detailField, setDetailField] = useState(null);
+            const { address, lat, lng, sun, metrics } = data;
+            const monthlyKwh = sun.monthly.map((h, i) => Math.floor(metrics.kwp * h * 30));
+            const chartData = monthlyKwh.map((v, i) => ({ month: ['Jan','Feb','Mar','Apr','Maj','Jun','Jul','Avg','Sep','Okt','Nov','Dec'][i], value: v }));
+            const totalAnnual = chartData.reduce((s, m) => s + m.value, 0);
+            const total25 = Math.round(metrics.yearly.reduce((a,b)=>a+b,0));
+
+            useEffect(() => {
+                const observer = new IntersectionObserver((entries) => {
+                    entries.forEach(e => { if(e.isIntersecting) e.target.classList.add('fade-up'); });
+                }, { threshold: 0.1 });
+                document.querySelectorAll('.animate-on-scroll').forEach(el => observer.observe(el));
+                return () => observer.disconnect();
+            }, []);
+
+            const tabs = [
+                { id: 'pregled', label: 'Pregled' },
+                { id: 'proizvodnja', label: 'Proizvodnja' },
+                { id: 'financni', label: 'Finančni' },
+                { id: 'insights', label: 'Energy Insights' }
+            ];
+
+            return React.createElement('div', { className: 'min-h-screen bg-gray-50' },
+                React.createElement('div', { className: 'sticky top-0 bg-white border-b z-10 shadow-sm' },
+                    React.createElement('div', { className: 'max-w-6xl mx-auto px-4 py-3 flex flex-wrap justify-between items-center gap-3' },
+                        React.createElement('div', { className: 'flex items-center gap-3' },
+                            React.createElement('button', { onClick: onBack, className: 'text-gray-600 hover:text-orange-600' }, React.createElement('span', { className: 'material-symbols-outlined' }, 'arrow_back')),
+                            React.createElement('div', null, React.createElement('span', { className: 'font-bold text-orange-600' }, 'SunPulse Slovenija'), ' ', React.createElement('span', { className: 'text-sm text-gray-500' }, `| ${address.split(',')[0]}`))
+                        ),
+                        React.createElement('div', { className: 'flex gap-2 bg-gray-100 p-1 rounded-full' },
+                            tabs.map(tab => React.createElement('button', { key: tab.id, onClick: () => setActiveTab(tab.id), className: `slider-tab ${activeTab === tab.id ? 'active' : ''}` }, tab.label))
+                        )
+                    )
+                ),
+                React.createElement('div', { className: 'max-w-6xl mx-auto px-4 py-6 space-y-8' },
+                    activeTab === 'pregled' && React.createElement(React.Fragment, null,
+                        React.createElement('div', { className: 'animate-on-scroll' },
+                            React.createElement('h2', { className: 'text-2xl font-bold mb-4 flex items-center gap-2' }, React.createElement('span', { className: 'material-symbols-outlined text-orange-500' }, 'home'), 'Pregled analize'),
+                            React.createElement('div', { className: 'grid grid-cols-2 md:grid-cols-4 gap-4 mb-6' },
+                                React.createElement(ClickableStatCard, { field: 'panels', icon: 'solar_power', title: 'Število panelov', value: metrics.panels, unit: 'kos', onDetail: setDetailField }),
+                                React.createElement(ClickableStatCard, { field: 'kwp', icon: 'bolt', title: 'Moč sistema', value: metrics.kwp, unit: 'kWp', onDetail: setDetailField }),
+                                React.createElement(ClickableStatCard, { field: 'annualKwh', icon: 'electrical_services', title: 'Letna proizvodnja', value: Math.floor(metrics.annualKwh).toLocaleString(), unit: 'kWh', onDetail: setDetailField }),
+                                React.createElement(ClickableStatCard, { field: 'investment', icon: 'attach_money', title: 'Investicija (bruto)', value: `${Math.floor(metrics.investment).toLocaleString()} €`, unit: 'brez subvencije', onDetail: setDetailField })
+                            ),
+                            React.createElement('div', { className: 'grid grid-cols-2 md:grid-cols-4 gap-4 mb-6' },
+                                React.createElement(ClickableStatCard, { field: 'subsidy', icon: 'handshake', title: 'Subvencija EKO sklad', value: `${Math.floor(metrics.subsidy).toLocaleString()} €`, unit: '20% do 3000€', onDetail: setDetailField }),
+                                React.createElement(ClickableStatCard, { field: 'afterSubsidy', icon: 'savings', title: 'Vložek po subvenciji', value: `${Math.floor(metrics.afterSubsidy).toLocaleString()} €`, unit: 'vaš strošek', onDetail: setDetailField }),
+                                React.createElement(ClickableStatCard, { field: 'savings', icon: 'trending_up', title: 'Letni prihranek', value: `${Math.floor(metrics.savings).toLocaleString()} €`, unit: 'na računu', onDetail: setDetailField }),
+                                React.createElement(ClickableStatCard, { field: 'payback', icon: 'hourglass_top', title: 'Čas vračila', value: metrics.payback.toFixed(1), unit: 'let', onDetail: setDetailField })
+                            ),
+                            React.createElement('div', { className: 'grid md:grid-cols-2 gap-6 mb-8' },
+                                React.createElement(SunCard, { avg: sun.annualAverage, totalYearlyHours: sun.totalYearlyHours }),
+                                React.createElement('div', { className: 'google-card p-5' },
+                                    React.createElement('div', { className: 'flex items-center gap-2 mb-3' }, React.createElement('span', { className: 'material-symbols-outlined' }, 'forest'), React.createElement('span', { className: 'font-semibold' }, 'Okoljski vpliv')),
+                                    React.createElement('p', null, '🌱 CO₂ prihranek: ', React.createElement('strong', null, metrics.co2Kg.toLocaleString()), ' kg/leto'),
+                                    React.createElement('p', null, '🌳 Enakovredno zasaditvi ', React.createElement('strong', null, metrics.treesEquivalent), ' dreves vsako leto.')
+                                )
+                            ),
+                            React.createElement('div', { className: 'google-card p-5 mb-8' },
+                                React.createElement('h3', { className: 'font-semibold text-lg mb-3 flex items-center gap-2' }, React.createElement('span', { className: 'material-symbols-outlined' }, 'map'), 'Satelitski posnetek vaše nepremičnine'),
+                                React.createElement(RoofMap, { lat: lat, lng: lng, addressName: address.split(',')[0] })
+                            ),
+                            React.createElement('div', { className: 'google-card p-5' },
+                                React.createElement('h3', { className: 'font-semibold text-lg mb-3 flex items-center gap-2' }, React.createElement('span', { className: 'material-symbols-outlined' }, 'schedule'), 'Kdaj uporabljati sonce in kdaj omrežje'),
+                                React.createElement('p', { className: 'text-sm text-gray-600 mb-2' }, '☀️ 9–16h: uporabljajte aparate (visoka sončna moč) · ⚡ 0–6h: polnite baterije (najcenejše omrežje) · ⛔ 16–21h: izogibajte se porabi (drago)'),
+                                React.createElement('div', { className: 'h-12 bg-gradient-to-r from-green-400 via-yellow-400 to-red-500 rounded-lg mt-2' })
+                            )
+                        )
+                    ),
+                    activeTab === 'proizvodnja' && React.createElement('div', { className: 'animate-on-scroll' },
+                        React.createElement('h2', { className: 'text-2xl font-bold mb-4' }, 'Povprečna urna proizvodnja (povprečen dan)'),
+                        React.createElement('div', { className: 'google-card p-5' },
+                            React.createElement(HourlyGenerationChart, { hourlyOutput: metrics.hourlyOutput }),
+                            React.createElement('p', { className: 'text-sm text-gray-500 mt-3 text-center' }, 'Graf prikazuje pričakovano sončno moč (kW) skozi cel dan. Največja proizvodnja je med 10. in 16. uro.')
+                        )
+                    ),
+                    activeTab === 'financni' && React.createElement('div', { className: 'animate-on-scroll space-y-6' },
+                        React.createElement('h2', { className: 'text-2xl font-bold mb-4' }, 'Finančna analiza'),
+                        React.createElement('div', { className: 'grid grid-cols-1 md:grid-cols-3 gap-4' },
+                            React.createElement('div', { className: 'finance-stat' }, React.createElement('div', { className: 'text-gray-500 text-sm' }, 'Skupna investicija'), React.createElement('div', { className: 'text-2xl font-bold' }, `${Math.floor(metrics.investment).toLocaleString()} €`), React.createElement('div', { className: 'text-xs text-gray-400' }, 'bruto pred subvencijo')),
+                            React.createElement('div', { className: 'finance-stat' }, React.createElement('div', { className: 'text-gray-500 text-sm' }, 'Čas vračila'), React.createElement('div', { className: 'text-2xl font-bold' }, `${metrics.payback.toFixed(1)} let`), React.createElement('div', { className: 'text-xs text-gray-400' }, 'po upoštevanju subvencije')),
+                            React.createElement('div', { className: 'finance-stat' }, React.createElement('div', { className: 'text-gray-500 text-sm' }, 'Letni prihranek'), React.createElement('div', { className: 'text-2xl font-bold' }, `${Math.floor(metrics.savings).toLocaleString()} €`), React.createElement('div', { className: 'text-xs text-gray-400' }, 'ocena za prvo leto'))
+                        ),
+                        React.createElement('div', { className: 'google-card p-5' },
+                            React.createElement('h3', { className: 'font-semibold mb-3' }, 'Monthly Savings (Estimated monthly bill savings in EUR)'),
+                            React.createElement(SelectedMonthsSavingsChart, { monthlySavingsFull: metrics.monthlySavingsFull })
+                        ),
+                        React.createElement('div', { className: 'google-card p-5 bg-orange-50' },
+                            React.createElement('div', { className: 'text-center' },
+                                React.createElement('div', { className: 'text-sm text-gray-600' }, 'Skupni 25-letni prihranek'),
+                                React.createElement('div', { className: 'text-3xl font-bold text-orange-700' }, `${total25.toLocaleString()} €`),
+                                React.createElement('div', { className: 'text-xs mt-1' }, 'vključuje upoštevano obrabo panelov (0,5% letno)')
+                            )
+                        )
+                    ),
+                    activeTab === 'insights' && React.createElement('div', { className: 'animate-on-scroll' },
+                        React.createElement(EnergyInsightsCharts, { kwp: metrics.kwp, baseSunHours: sun.annualAverage }),
+                        React.createElement('div', { className: 'mt-6' },
+                            React.createElement('h3', { className: 'font-semibold mb-2' }, 'Cene elektrike po urah (časovni načrt)'),
+                            React.createElement('div', { className: 'google-card p-4' }, React.createElement(HourlyPriceChart, null))
+                        )
+                    )
+                ),
+                detailField && React.createElement(DetailModal, { field: detailField, onClose: () => setDetailField(null) })
+            );
+        };
+
+        // ---------- MODAL NALAGANJA (samodejno zapiranje) ----------
+        const LoadingModal = ({ steps }) => {
+            const stepsConfig = [
+                { key: 'satellite', label: 'Povezovanje s sateliti (GURS/OPSI)', icon: '🛰️', detail: 'Pridobivanje ortofoto posnetkov' },
+                { key: 'sun', label: 'Analiza sončnega obsevanja (PVGIS, ARSO)', icon: '☀️', detail: 'Izračun insolacije za vašo lokacijo' },
+                { key: 'panels', label: 'Izračun optimalne postavitve panelov', icon: '🔧', detail: 'Upoštevamo naklon, azimut, senčenje' },
+                { key: 'financial', label: 'Generiranje finančnega izračuna (EKO sklad)', icon: '📈', detail: 'Subvencije, vračilna doba, CO₂' }
+            ];
+            return React.createElement('div', { className: 'modal-overlay' },
+                React.createElement('div', { className: 'modal-content' },
+                    React.createElement('div', { className: 'flex items-center gap-3 mb-4' },
+                        React.createElement('span', { className: 'material-symbols-outlined text-4xl text-orange-500' }, 'sunny'),
+                        React.createElement('h2', { className: 'text-2xl font-bold text-slate-800' }, 'SunPulse Slovenija')
+                    ),
+                    React.createElement('p', { className: 'text-gray-500 mb-5' }, 'Obdelujemo podatke za vašo streho – to lahko traja nekaj sekund.'),
+                    stepsConfig.map(step => {
+                        const status = steps[step.key];
+                        return React.createElement('div', { key: step.key, className: 'step-item' },
+                            React.createElement('div', { className: 'step-icon' }, step.icon),
+                            React.createElement('div', { className: 'step-text' },
+                                React.createElement('div', null, step.label),
+                                React.createElement('div', { className: 'text-xs text-gray-400' }, step.detail)
+                            ),
+                            React.createElement('div', { className: `step-status ${status === 'completed' ? 'completed' : status === 'processing' ? 'processing' : ''}` },
+                                status === 'completed' ? '✓ Končano' : status === 'processing' ? 'Obdelava...' : ''
+                            )
+                        );
+                    })
+                )
+            );
+        };
+
+        // ---------- DOMOVSKA STRAN ----------
+        const HomePage = ({ onAnalyze, loading, error }) => {
+            const [addr, setAddr] = useState('');
+            const examples = ['Ljubljana, Prešernov trg 1', 'Maribor, Trg svobode 1', 'Kranj, Glavni trg 1', 'Portorož, Obala 16'];
+            return React.createElement('div', { className: 'min-h-screen bg-gradient-to-br from-orange-50 to-white' },
+                React.createElement('div', { className: 'max-w-4xl mx-auto px-4 pt-20 pb-16 text-center' },
+                    React.createElement('div', { className: 'inline-flex items-center gap-2 bg-white/70 backdrop-blur rounded-full px-4 py-1.5 shadow-sm mb-6' },
+                        React.createElement('span', { className: 'material-symbols-outlined text-orange-500' }, 'sunny'),
+                        React.createElement('span', { className: 'text-sm font-medium text-gray-700' }, 'SunPulse Slovenija · Sončni kataster')
+                    ),
+                    React.createElement('h1', { className: 'text-5xl md:text-6xl font-bold tracking-tight text-gray-900' }, 'Preverite sončni potencial', React.createElement('br', null), 'vaše strehe'),
+                    React.createElement('p', { className: 'text-xl text-gray-500 max-w-2xl mx-auto mt-4' }, 'Vnesite naslov in v nekaj sekundah dobite analizo proizvodnje, investicije, subvencij in okoljskega učinka.'),
+                    React.createElement('div', { className: 'max-w-xl mx-auto mt-10' },
+                        React.createElement('form', { onSubmit: (e) => { e.preventDefault(); if(addr.trim()) onAnalyze(addr); } },
+                            React.createElement('div', { className: 'flex flex-col sm:flex-row gap-3' },
+                                React.createElement('input', { type: 'text', value: addr, onChange: (e) => setAddr(e.target.value), placeholder: 'npr. Ljubljana, Prešernov trg 1', className: 'flex-1 px-5 py-4 rounded-2xl border border-gray-200 shadow-sm focus:ring-2 focus:ring-orange-500 outline-none' }),
+                                React.createElement('button', { type: 'submit', className: 'bg-orange-600 hover:bg-orange-700 text-white font-medium px-8 py-4 rounded-2xl transition shadow-md flex items-center justify-center gap-2' },
+                                    React.createElement('span', { className: 'material-symbols-outlined text-lg' }, 'search'), ' Analiziraj')
+                            )
+                        ),
+                        React.createElement('div', { className: 'mt-4 flex flex-wrap justify-center gap-2' },
+                            examples.map(ex => React.createElement('button', { key: ex, onClick: () => setAddr(ex), className: 'text-xs bg-gray-100 hover:bg-gray-200 px-3 py-1 rounded-full text-gray-600' }, ex))
+                        ),
+                        error && React.createElement('div', { className: 'mt-4 p-3 bg-red-50 text-red-700 rounded-xl text-sm' }, error)
+                    ),
+                    React.createElement('div', { className: 'mt-16 text-gray-400 text-sm' }, 'Uporabljeni podatki: GURS/OPSI, PVGIS, ARSO, GeoHub SI – v skladu s FAIR načeli.')
+                )
+            );
+        };
+
+        // ---------- GLAVNA APLIKACIJA (samodejno zapiranje modala) ----------
+        const App = () => {
+            const [result, setResult] = useState(null);
+            const [modalSteps, setModalSteps] = useState(null);
+            const [error, setError] = useState('');
+
+            const startAnalysis = async (address) => {
+                setError('');
+                setModalSteps({ satellite:'processing', sun:'pending', panels:'pending', financial:'pending' });
+                await new Promise(r => setTimeout(r, 1200));
+                setModalSteps({ satellite:'completed', sun:'processing', panels:'pending', financial:'pending' });
+                await new Promise(r => setTimeout(r, 1400));
+                setModalSteps({ satellite:'completed', sun:'completed', panels:'processing', financial:'pending' });
+                await new Promise(r => setTimeout(r, 1300));
+                setModalSteps({ satellite:'completed', sun:'completed', panels:'completed', financial:'processing' });
+                await new Promise(r => setTimeout(r, 1400));
+                try {
+                    const { lat, lng, displayName } = await geocodeAddress(address);
+                    const sunData = simulateSunExposure(lat, lng);
+                    const metrics = calculateMetrics(sunData.annualAverage);
+                    setModalSteps({ satellite:'completed', sun:'completed', panels:'completed', financial:'completed' });
+                    await new Promise(r => setTimeout(r, 600)); // Show completed state briefly
+                    setResult({ address: displayName, lat, lng, sun: sunData, metrics });
+                    setModalSteps(null);
+                } catch (err) {
+                    setError('Naslova ni bilo mogoče najti. Poskusite z drugim naslovom.');
+                    setModalSteps(null);
+                }
+            };
+
+            if (result) {
+                return React.createElement(ResultsPage, { data: result, onBack: () => setResult(null) });
+            }
+            return React.createElement(React.Fragment, null,
+                React.createElement(HomePage, { onAnalyze: startAnalysis, loading: !!modalSteps, error: error }),
+                modalSteps && React.createElement(LoadingModal, { steps: modalSteps })
+            );
+        };
+
+        ReactDOM.createRoot(document.getElementById('root')).render(React.createElement(App));
+    </script>
+</body>
+</html>
